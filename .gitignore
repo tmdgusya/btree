@@ -2,3 +2,5 @@
 *.list
 paged_list.llst
 offset_list.llst
+
+.gocache/**

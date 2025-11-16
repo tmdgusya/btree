@@ -40,6 +40,27 @@ const HEADER_SIZE = 32 // 4 + 2 + 2 + 4 + 4 + 2 + 4 + 2 + 8
 const NullPage uint32 = ^uint32(0)
 const NullSlot uint16 = ^uint16(0)
 
+// LinkedListStore 인터페이스와 공통 핸들 정의
+type LinkedListStore interface {
+	Open(path string, truncate bool) (*Handle, error)
+	AppendTail(h *Handle, value uint32) error
+	PrependHead(h *Handle, value uint32) error
+	DeleteFirstByValue(h *Handle, value uint32) (bool, error)
+	TraverseValues(h *Handle) ([]uint32, error)
+	Close(h *Handle) error
+}
+
+type HeaderRecord interface {
+	headerVersion() uint16
+}
+
+type Handle struct {
+	File   *os.File
+	Header HeaderRecord
+}
+
+type PagedStore struct{}
+
 type Header struct {
 	Magic     [4]byte
 	Version   uint16
@@ -50,6 +71,10 @@ type Header struct {
 	TailPage  uint32
 	TailSlot  uint16
 	Size      uint64
+}
+
+func (h *Header) headerVersion() uint16 {
+	return h.Version
 }
 
 // Used - 이 페이지에서 사용중인 슬롯 개수
@@ -65,7 +90,15 @@ type Node struct {
 	_pad     uint8
 }
 
-func OpenPagedList(path string, truncate bool) (*os.File, *Header, error) {
+func ensurePagedHeader(h *Handle) (*Header, error) {
+	header, ok := h.Header.(*Header)
+	if !ok {
+		return nil, fmt.Errorf("paged list handle does not contain a paged header")
+	}
+	return header, nil
+}
+
+func (s *PagedStore) Open(path string, truncate bool) (*Handle, error) {
 	flags := os.O_RDWR | os.O_CREATE
 	if truncate {
 		flags |= os.O_TRUNC
@@ -73,13 +106,13 @@ func OpenPagedList(path string, truncate bool) (*os.File, *Header, error) {
 
 	f, err := os.OpenFile(path, flags, 0644)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	info, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return nil, nil, err
+		return nil, err
 	}
 
 	if info.Size() == 0 || truncate {
@@ -97,19 +130,19 @@ func OpenPagedList(path string, truncate bool) (*os.File, *Header, error) {
 
 		if err := writeHeader(f, h); err != nil {
 			f.Close()
-			return nil, nil, err
+			return nil, err
 		}
 
-		return f, h, nil
+		return &Handle{File: f, Header: h}, nil
 	}
 
 	header := &Header{}
 	if err := readHeader(f, header); err != nil {
 		f.Close()
-		return nil, nil, err
+		return nil, err
 	}
 
-	return f, header, nil
+	return &Handle{File: f, Header: header}, nil
 }
 
 func writeHeader(f *os.File, h *Header) error {
@@ -162,6 +195,10 @@ func readHeader(f *os.File, h *Header) error {
 	h.Size = Endian.Uint64(buf[24:32])
 
 	return nil
+}
+
+func (s *PagedStore) Close(h *Handle) error {
+	return h.File.Close()
 }
 
 // 페이지 슬롯 유틸리티
@@ -295,7 +332,13 @@ func allocateSlot(f *os.File, h *Header) (pageID uint32, slotIndex uint16, err e
 	return pageID, slotIndex, nil
 }
 
-func appendTail(f *os.File, h *Header, value uint32) error {
+func (s *PagedStore) AppendTail(handle *Handle, value uint32) error {
+	h, err := ensurePagedHeader(handle)
+	if err != nil {
+		return err
+	}
+	f := handle.File
+
 	pageID, slotIndex, err := allocateSlot(f, h)
 	if err != nil {
 		return err
@@ -345,7 +388,13 @@ func appendTail(f *os.File, h *Header, value uint32) error {
 	return writeHeader(f, h)
 }
 
-func prependHead(f *os.File, h *Header, value uint32) error {
+func (s *PagedStore) PrependHead(handle *Handle, value uint32) error {
+	h, err := ensurePagedHeader(handle)
+	if err != nil {
+		return err
+	}
+	f := handle.File
+
 	pageID, slotIndex, err := allocateSlot(f, h)
 	if err != nil {
 		return err
@@ -373,7 +422,13 @@ func prependHead(f *os.File, h *Header, value uint32) error {
 	return writeHeader(f, h)
 }
 
-func traverseValues(f *os.File, h *Header) ([]uint32, error) {
+func (s *PagedStore) TraverseValues(handle *Handle) ([]uint32, error) {
+	h, err := ensurePagedHeader(handle)
+	if err != nil {
+		return nil, err
+	}
+	f := handle.File
+
 	values := make([]uint32, 0, h.Size)
 
 	page := h.HeadPage
@@ -395,47 +450,138 @@ func traverseValues(f *os.File, h *Header) ([]uint32, error) {
 	return values, nil
 }
 
+func (s *PagedStore) DeleteFirstByValue(handle *Handle, value uint32) (bool, error) {
+	h, err := ensurePagedHeader(handle)
+	if err != nil {
+		return false, err
+	}
+	f := handle.File
+
+	if h.HeadPage == NullPage || h.HeadSlot == NullSlot {
+		return false, nil
+	}
+
+	prevPage := NullPage
+	prevSlot := NullSlot
+	page := h.HeadPage
+	slot := h.HeadSlot
+
+	for page != NullPage && slot != NullSlot {
+		node, err := readSlot(f, page, slot)
+		if err != nil {
+			return false, err
+		}
+
+		if node.Value == value && node.Tomb == 0 {
+			node.Tomb = 1
+			if err := writeSlot(f, page, slot, node); err != nil {
+				return false, err
+			}
+
+			if prevPage == NullPage {
+				h.HeadPage = node.NextPage
+				h.HeadSlot = node.NextSlot
+				if h.HeadPage == NullPage || h.HeadSlot == NullSlot {
+					h.TailPage = NullPage
+					h.TailSlot = NullSlot
+				}
+			} else {
+				prevNode, err := readSlot(f, prevPage, prevSlot)
+				if err != nil {
+					return false, err
+				}
+				prevNode.NextPage = node.NextPage
+				prevNode.NextSlot = node.NextSlot
+				if err := writeSlot(f, prevPage, prevSlot, prevNode); err != nil {
+					return false, err
+				}
+
+				if page == h.TailPage && slot == h.TailSlot {
+					h.TailPage = prevPage
+					h.TailSlot = prevSlot
+				}
+			}
+
+			if h.Size > 0 {
+				h.Size--
+			}
+			if err := writeHeader(f, h); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+
+		prevPage = page
+		prevSlot = slot
+		page = node.NextPage
+		slot = node.NextSlot
+	}
+
+	return false, nil
+}
+
 func main() {
+	var store LinkedListStore = &PagedStore{}
+
 	// 교육용: 항상 새로 시작하도록 truncate=true
-	f, h, err := OpenPagedList("paged_list.llst", true)
+	handle, err := store.Open("paged_list.llst", true)
 	if err != nil {
 		panic(err)
 	}
-	defer f.Close()
+	defer store.Close(handle)
 
 	// 머리에 2,1,0 추가: [2,1,0]
-	if err := prependHead(f, h, 0); err != nil {
+	if err := store.PrependHead(handle, 0); err != nil {
 		panic(err)
 	}
-	if err := prependHead(f, h, 1); err != nil {
+	if err := store.PrependHead(handle, 1); err != nil {
 		panic(err)
 	}
-	if err := prependHead(f, h, 2); err != nil {
+	if err := store.PrependHead(handle, 2); err != nil {
 		panic(err)
 	}
 
 	// 꼬리에 3,4,5 추가: [2,1,0,3,4,5]
-	if err := appendTail(f, h, 3); err != nil {
+	if err := store.AppendTail(handle, 3); err != nil {
 		panic(err)
 	}
-	if err := appendTail(f, h, 4); err != nil {
+	if err := store.AppendTail(handle, 4); err != nil {
 		panic(err)
 	}
-	if err := appendTail(f, h, 5); err != nil {
+	if err := store.AppendTail(handle, 5); err != nil {
 		panic(err)
 	}
 
 	// 리스트 전체를 순회해 값 출력
-	vals, err := traverseValues(f, h)
+	vals, err := store.TraverseValues(handle)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("paged list values:", vals)
+	fmt.Println("paged list before delete:", vals)
+
+	removed, err := store.DeleteFirstByValue(handle, 3)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("deleted 3? ->", removed)
+
+	vals, err = store.TraverseValues(handle)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("paged list after delete :", vals)
 
 	// 헤더를 다시 읽어와 상태 확인 (파일 재오픈 시나리오 흉내)
-	if err := readHeader(f, h); err != nil {
+	if _, err := handle.File.Seek(0, io.SeekStart); err != nil {
+		panic(err)
+	}
+	hdr, err := ensurePagedHeader(handle)
+	if err != nil {
+		panic(err)
+	}
+	if err := readHeader(handle.File, hdr); err != nil {
 		panic(err)
 	}
 	fmt.Printf("Header{PageCount=%d, Size=%d, Head=(%d,%d), Tail=(%d,%d)}\n",
-		h.PageCount, h.Size, h.HeadPage, h.HeadSlot, h.TailPage, h.TailSlot)
+		hdr.PageCount, hdr.Size, hdr.HeadPage, hdr.HeadSlot, hdr.TailPage, hdr.TailSlot)
 }

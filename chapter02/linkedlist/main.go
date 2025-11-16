@@ -19,6 +19,27 @@ const NullOffset int64 = -1
 // Node 의 on-disk 고정 길이(예: 16바이트) 로 맞추기 위한 패딩 크기
 const nodePadBytes = 3
 
+// LinkedListStore 인터페이스와 공통 핸들 정의
+type LinkedListStore interface {
+	Open(path string, truncate bool) (*Handle, error)
+	AppendTail(h *Handle, value uint32) error
+	PrependHead(h *Handle, value uint32) error
+	DeleteFirstByValue(h *Handle, value uint32) (bool, error)
+	TraverseValues(h *Handle) ([]uint32, error)
+	Close(h *Handle) error
+}
+
+type HeaderRecord interface {
+	headerVersion() uint16
+}
+
+type Handle struct {
+	File   *os.File
+	Header HeaderRecord
+}
+
+type OffsetStore struct{}
+
 // 구조체
 // 파일 헤
 // Magic: 포맷 식별자
@@ -38,6 +59,10 @@ type Header struct {
 	FreeList   int64
 }
 
+func (h *Header) headerVersion() uint16 {
+	return h.Version
+}
+
 // LinkedList 노드
 // - Value: 실제 값(32비트 정수; 예제 단순화를 위해 uint32 이용)
 // - Next: 다음 노드의 파일 오프셋 (없으면 -1)
@@ -48,6 +73,14 @@ type Node struct {
 	Next  int64
 	Tomb  uint8
 	_pad  [nodePadBytes]byte
+}
+
+func ensureOffsetHeader(h *Handle) (*Header, error) {
+	header, ok := h.Header.(*Header)
+	if !ok {
+		return nil, fmt.Errorf("linked list handle does not contain an offset header")
+	}
+	return header, nil
 }
 
 func writeHeader(f *os.File, hdr *Header) error {
@@ -69,19 +102,20 @@ func writeHeader(f *os.File, hdr *Header) error {
 }
 
 // 파일 열기/초기화
-func Open(path string, truncate bool) (*os.File, *Header, error) {
+func (s *OffsetStore) Open(path string, truncate bool) (*Handle, error) {
 	flags := os.O_RDWR | os.O_CREATE
 	if truncate {
 		flags |= os.O_TRUNC
 	}
 	f, err := os.OpenFile(path, flags, 0666)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	info, err := f.Stat()
 	if err != nil {
-		return nil, nil, err
+		f.Close()
+		return nil, err
 	}
 
 	if info.Size() == 0 || truncate {
@@ -95,7 +129,8 @@ func Open(path string, truncate bool) (*os.File, *Header, error) {
 			FreeList:   NullOffset,
 		}
 		if err := writeHeader(f, hdr); err != nil {
-			return nil, nil, err
+			f.Close()
+			return nil, err
 		}
 	}
 
@@ -103,10 +138,13 @@ func Open(path string, truncate bool) (*os.File, *Header, error) {
 
 	if err := readHeader(f, hrd); err != nil {
 		f.Close()
-		return nil, nil, err
+		return nil, err
 	}
 
-	return f, hrd, nil
+	return &Handle{
+		File:   f,
+		Header: hrd,
+	}, nil
 }
 
 func readHeader(f *os.File, h *Header) error {
@@ -135,6 +173,10 @@ func readHeader(f *os.File, h *Header) error {
 	h.FreeList = int64(Endian.Uint64(buf[32:40]))
 
 	return nil
+}
+
+func (s *OffsetStore) Close(h *Handle) error {
+	return h.File.Close()
 }
 
 // 노드 읽기 / 쓰기 (고정 16 바이트)
@@ -180,7 +222,13 @@ func readNodeAt(f *os.File, off int64) (*Node, error) {
 }
 
 // 리스트 연산
-func appendTail(f *os.File, h *Header, value uint32) error {
+func (s *OffsetStore) AppendTail(handle *Handle, value uint32) error {
+	h, err := ensureOffsetHeader(handle)
+	if err != nil {
+		return err
+	}
+	f := handle.File
+
 	newNode := &Node{
 		Value: value,
 		Next:  NullOffset,
@@ -221,7 +269,13 @@ func appendTail(f *os.File, h *Header, value uint32) error {
 }
 
 // 리스트 연산
-func prependHead(f *os.File, h *Header, value uint32) error {
+func (s *OffsetStore) PrependHead(handle *Handle, value uint32) error {
+	h, err := ensureOffsetHeader(handle)
+	if err != nil {
+		return err
+	}
+	f := handle.File
+
 	newNode := &Node{
 		Value: value,
 		Next:  h.HeadOffset,
@@ -247,7 +301,13 @@ func prependHead(f *os.File, h *Header, value uint32) error {
 	return writeHeader(f, h)
 }
 
-func deleteFirstByValue(f *os.File, h *Header, value uint32) (bool, error) {
+func (s *OffsetStore) DeleteFirstByValue(handle *Handle, value uint32) (bool, error) {
+	h, err := ensureOffsetHeader(handle)
+	if err != nil {
+		return false, err
+	}
+	f := handle.File
+
 	if h.HeadOffset == NullOffset {
 		return false, nil
 	}
@@ -311,7 +371,13 @@ func deleteFirstByValue(f *os.File, h *Header, value uint32) (bool, error) {
 	return false, nil
 }
 
-func traverseValues(f *os.File, h *Header) ([]uint32, error) {
+func (s *OffsetStore) TraverseValues(handle *Handle) ([]uint32, error) {
+	h, err := ensureOffsetHeader(handle)
+	if err != nil {
+		return nil, err
+	}
+	f := handle.File
+
 	out := make([]uint32, 0, h.Size)
 	off := h.HeadOffset
 
@@ -329,63 +395,69 @@ func traverseValues(f *os.File, h *Header) ([]uint32, error) {
 }
 
 func main() {
+	var store LinkedListStore = &OffsetStore{}
+
 	// 교육용: 항상 새로 시작(O_TRUNC)
-	f, hdr, err := Open("linked_list.db", true)
+	handle, err := store.Open("linked_list.db", true)
 	if err != nil {
 		panic(err)
 	}
-	defer f.Close()
+	defer store.Close(handle)
 
 	// 머리/꼬리 섞어서 삽입해보자(랜덤 I/O 상황 만들기)
 	// list: [H] 2 -> 1 -> 0   (prepend 2,1,0)
-	if err := prependHead(f, hdr, 0); err != nil {
+	if err := store.PrependHead(handle, 0); err != nil {
 		panic(err)
 	}
-	if err := prependHead(f, hdr, 1); err != nil {
+	if err := store.PrependHead(handle, 1); err != nil {
 		panic(err)
 	}
-	if err := prependHead(f, hdr, 2); err != nil {
+	if err := store.PrependHead(handle, 2); err != nil {
 		panic(err)
 	}
 
 	// 꼬리에 추가 x3
 	// list: 2 -> 1 -> 0 -> 3 -> 4 -> 5
-	if err := appendTail(f, hdr, 3); err != nil {
+	if err := store.AppendTail(handle, 3); err != nil {
 		panic(err)
 	}
-	if err := appendTail(f, hdr, 4); err != nil {
+	if err := store.AppendTail(handle, 4); err != nil {
 		panic(err)
 	}
-	if err := appendTail(f, hdr, 5); err != nil {
+	if err := store.AppendTail(handle, 5); err != nil {
 		panic(err)
 	}
 
 	// 순회 출력(삭제 전)
-	vals, err := traverseValues(f, hdr)
+	vals, err := store.TraverseValues(handle)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println("before delete:", vals) // 기대: [2 1 0 3 4 5]
 
 	// 값 3을 논리 삭제(첫 매칭만)
-	found, err := deleteFirstByValue(f, hdr, 3)
+	found, err := store.DeleteFirstByValue(handle, 3)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println("deleted 3? ->", found)
 
 	// 순회 출력(삭제 후)
-	vals, err = traverseValues(f, hdr)
+	vals, err = store.TraverseValues(handle)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println("after delete :", vals) // 기대: [2 1 0 4 5]
 
 	// 헤더를 다시 읽어 확인(파일 재오픈 상황 흉내)
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
+	if _, err := handle.File.Seek(0, io.SeekStart); err != nil {
 		panic(err)
 	}
-	if err := readHeader(f, hdr); err != nil {
+	hdr, err := ensureOffsetHeader(handle)
+	if err != nil {
+		panic(err)
+	}
+	if err := readHeader(handle.File, hdr); err != nil {
 		panic(err)
 	}
 	fmt.Printf("Header{Head=%d, Tail=%d, Size=%d, FreeList=%d}\n",
