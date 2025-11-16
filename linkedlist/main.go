@@ -106,11 +106,6 @@ func Open(path string, truncate bool) (*os.File, *Header, error) {
 		return nil, nil, err
 	}
 
-	if hrd.Magic != Magic {
-		f.Close()
-		return nil, nil, ErrInvalidMagic
-	}
-
 	return f, hrd, nil
 }
 
@@ -126,7 +121,12 @@ func readHeader(f *os.File, h *Header) error {
 	}
 
 	copy(h.Magic[:], buf[0:4])
-	h.Magic = Magic
+
+	// Magic 검증
+	if h.Magic != Magic {
+		return ErrInvalidMagic
+	}
+
 	h.Version = Endian.Uint16(buf[4:6])
 	h.PageSize = Endian.Uint16(buf[6:8])
 	h.HeadOffset = int64(Endian.Uint64(buf[8:16]))
