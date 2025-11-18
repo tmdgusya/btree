@@ -653,23 +653,20 @@ func pagedTraverseWithPageStats(f *CountingFile, h *PagedHeader) ([]uint32, map[
 	values := make([]uint32, 0, h.Size)
 	pageVisits := make(map[uint32]int)
 
-	page := h.HeadPage
-	slot := h.HeadSlot
-
-	for page != NullPage && slot != NullSlot {
-		n, err := readSlot(f, page, slot)
+	for pageID := uint32(0); pageID < h.PageCount; pageID++ {
+		ph, err := readPageHeader(f, pageID)
 		if err != nil {
-			return nil, nil, err
+			return nil, pageVisits, err
 		}
 
-		values = append(values, n.Value)
-
-		// 이 노드를 담고 있는 페이지 번호 기록
-		pageVisits[page]++
-
-		page = n.NextPage
-		slot = n.NextSlot
+		for slotID := uint16(0); slotID < ph.Used; slotID++ {
+			_, err := readSlot(f, pageID, slotID)
+			if err != nil {
+				return nil, pageVisits, err
+			}
+		}
 	}
+
 	return values, pageVisits, nil
 }
 
@@ -688,11 +685,6 @@ func main() {
 	}
 	defer offsetFile.Close()
 
-	for i := 0; i < 100; i++ {
-		if err := offsetPrependHead(offsetFile, offsetHdr, uint32(i)); err != nil {
-			panic(err)
-		}
-	}
 	for i := 100; i < N; i++ {
 		if err := offsetAppendTail(offsetFile, offsetHdr, uint32(i)); err != nil {
 			panic(err)
@@ -714,11 +706,6 @@ func main() {
 	}
 	defer pagedFile.Close()
 
-	for i := 0; i < 100; i++ {
-		if err := pagedPrependHead(pagedFile, pagedHdr, uint32(i)); err != nil {
-			panic(err)
-		}
-	}
 	for i := 100; i < N; i++ {
 		if err := pagedAppendTail(pagedFile, pagedHdr, uint32(i)); err != nil {
 			panic(err)

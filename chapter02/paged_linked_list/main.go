@@ -47,6 +47,7 @@ type LinkedListStore interface {
 	PrependHead(h *Handle, value uint32) error
 	DeleteFirstByValue(h *Handle, value uint32) (bool, error)
 	TraverseValues(h *Handle) ([]uint32, error)
+	TraverseValuesPhysical(h *Handle) ([]uint32, error)
 	Close(h *Handle) error
 }
 
@@ -88,6 +89,12 @@ type Node struct {
 	NextSlot uint16
 	Tomb     uint8
 	_pad     uint8
+}
+
+type PageBuffer struct {
+	pageID uint32 // 현재 버퍼가 담고 있는 페이지 ID
+	data   []byte // len == PAGE_SIZE
+	valid  bool   // 아직 안 채워졌는지 여부
 }
 
 func ensurePagedHeader(h *Handle) (*Header, error) {
@@ -434,8 +441,10 @@ func (s *PagedStore) TraverseValues(handle *Handle) ([]uint32, error) {
 	page := h.HeadPage
 	slot := h.HeadSlot
 
+	var pb PageBuffer
+
 	for page != NullPage && slot != NullSlot {
-		node, err := readSlot(f, page, slot)
+		node, err := readSlotWithBuffer(f, &pb, page, slot)
 		if err != nil {
 			return nil, err
 		}
@@ -448,6 +457,79 @@ func (s *PagedStore) TraverseValues(handle *Handle) ([]uint32, error) {
 	}
 
 	return values, nil
+}
+
+func (s *PagedStore) TraverseValuesPhysical(handle *Handle) ([]uint32, error) {
+	h, err := ensurePagedHeader(handle)
+	if err != nil {
+		return nil, err
+	}
+	f := handle.File
+
+	values := make([]uint32, 0, h.Size)
+
+	for pageID := uint32(0); pageID < h.PageCount; pageID++ {
+		ph, err := readPageHeader(f, pageID)
+		if err != nil {
+			return nil, err
+		}
+
+		for slotID := uint16(0); slotID < ph.Used; slotID++ {
+			node, err := readSlot(f, pageID, slotID)
+			if err != nil {
+				return nil, err
+			}
+			if node.Tomb == 0 {
+				values = append(values, node.Value)
+			}
+		}
+	}
+
+	return values, nil
+}
+
+func (pb *PageBuffer) loadPage(f *os.File, pageID uint32) error {
+	offset := pageOffset(pageID)
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+
+	if pb.data == nil || len(pb.data) != PAGE_SIZE {
+		pb.data = make([]byte, PAGE_SIZE)
+	}
+
+	if _, err := io.ReadFull(f, pb.data); err != nil {
+		return err
+	}
+
+	pb.pageID = pageID
+	pb.valid = true
+	return nil
+}
+
+func readSlotWithBuffer(f *os.File, pb *PageBuffer, pageID uint32, slotID uint16) (Node, error) {
+	// 1) 버퍼에 원하는 페이지가 없으면 페이지 전체를 한 번 읽어온다.
+	if !pb.valid || pb.pageID != pageID {
+		if err := pb.loadPage(f, pageID); err != nil {
+			return Node{}, err
+		}
+	}
+
+	// 2) 페이지 내에서 이 슬롯이 시작하는 오프셋 계산
+	//    [PageHeader(2바이트)] [Slot0] [Slot1] ...
+	start := PAGE_HEADER_SIZE + int64(SLOT_SIZE)*int64(slotID)
+
+	// 3) buf[start : start+SLOT_SIZE] 부분만 잘라서 파싱
+	slotBytes := pb.data[start : start+SLOT_SIZE]
+
+	var node Node
+	node.Value = Endian.Uint32(slotBytes[0:4])
+	node.NextPage = Endian.Uint32(slotBytes[4:8])
+	node.NextSlot = Endian.Uint16(slotBytes[8:10])
+	node.Tomb = slotBytes[10]
+	node._pad = slotBytes[11]
+
+	return node, nil
 }
 
 func (s *PagedStore) DeleteFirstByValue(handle *Handle, value uint32) (bool, error) {
@@ -530,18 +612,16 @@ func main() {
 	}
 	defer store.Close(handle)
 
-	// 머리에 2,1,0 추가: [2,1,0]
-	if err := store.PrependHead(handle, 0); err != nil {
+	if err := store.AppendTail(handle, 0); err != nil {
 		panic(err)
 	}
-	if err := store.PrependHead(handle, 1); err != nil {
+	if err := store.AppendTail(handle, 1); err != nil {
 		panic(err)
 	}
-	if err := store.PrependHead(handle, 2); err != nil {
+	if err := store.AppendTail(handle, 2); err != nil {
 		panic(err)
 	}
 
-	// 꼬리에 3,4,5 추가: [2,1,0,3,4,5]
 	if err := store.AppendTail(handle, 3); err != nil {
 		panic(err)
 	}
