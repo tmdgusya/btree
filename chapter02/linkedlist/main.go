@@ -23,7 +23,6 @@ const nodePadBytes = 3
 type LinkedListStore interface {
 	Open(path string, truncate bool) (*Handle, error)
 	AppendTail(h *Handle, value uint32) error
-	PrependHead(h *Handle, value uint32) error
 	DeleteFirstByValue(h *Handle, value uint32) (bool, error)
 	TraverseValues(h *Handle) ([]uint32, error)
 	Close(h *Handle) error
@@ -48,7 +47,6 @@ type OffsetStore struct{}
 // HeadOffset: 첫 노드의 파일 오프셋(없으면 -1)
 // TailOffset: 마지막 노드의 파일 오프셋(없으면 -1)
 // Size: 통계 / 검증 용도
-// FreeList: 삭제된 노드들의 단일 연결리스트 머리
 type Header struct {
 	Magic      [4]byte
 	Version    uint16
@@ -56,7 +54,6 @@ type Header struct {
 	HeadOffset int64
 	TailOffset int64
 	Size       int64
-	FreeList   int64
 }
 
 func (h *Header) headerVersion() uint16 {
@@ -88,14 +85,13 @@ func writeHeader(f *os.File, hdr *Header) error {
 		return err
 	}
 
-	buf := make([]byte, 0, 4+2+2+8+8+8+8)
+	buf := make([]byte, 0, 4+2+2+8+8+8)
 	buf = append(buf, hdr.Magic[:]...)
 	buf = Endian.AppendUint16(buf, hdr.Version)
 	buf = Endian.AppendUint16(buf, hdr.PageSize)
 	buf = Endian.AppendUint64(buf, uint64(hdr.HeadOffset))
 	buf = Endian.AppendUint64(buf, uint64(hdr.TailOffset))
 	buf = Endian.AppendUint64(buf, uint64(hdr.Size))
-	buf = Endian.AppendUint64(buf, uint64(hdr.FreeList))
 
 	_, err := f.Write(buf)
 	return err
@@ -126,7 +122,6 @@ func (s *OffsetStore) Open(path string, truncate bool) (*Handle, error) {
 			HeadOffset: NullOffset,
 			TailOffset: NullOffset,
 			Size:       0,
-			FreeList:   NullOffset,
 		}
 		if err := writeHeader(f, hdr); err != nil {
 			f.Close()
@@ -152,7 +147,7 @@ func readHeader(f *os.File, h *Header) error {
 		return err
 	}
 
-	buf := make([]byte, 4+2+2+8+8+8+8)
+	buf := make([]byte, 4+2+2+8+8+8)
 
 	if _, err := io.ReadFull(f, buf); err != nil {
 		return err
@@ -170,7 +165,6 @@ func readHeader(f *os.File, h *Header) error {
 	h.HeadOffset = int64(Endian.Uint64(buf[8:16]))
 	h.TailOffset = int64(Endian.Uint64(buf[16:24]))
 	h.Size = int64(Endian.Uint64(buf[24:32]))
-	h.FreeList = int64(Endian.Uint64(buf[32:40]))
 
 	return nil
 }
@@ -268,39 +262,6 @@ func (s *OffsetStore) AppendTail(handle *Handle, value uint32) error {
 	return writeHeader(f, h)
 }
 
-// 리스트 연산
-func (s *OffsetStore) PrependHead(handle *Handle, value uint32) error {
-	h, err := ensureOffsetHeader(handle)
-	if err != nil {
-		return err
-	}
-	f := handle.File
-
-	newNode := &Node{
-		Value: value,
-		Next:  h.HeadOffset,
-		Tomb:  0,
-	}
-
-	newOff, err := f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return err
-	}
-
-	if err := writeNodeAt(f, newOff, newNode); err != nil {
-		return err
-	}
-
-	if h.HeadOffset == NullOffset {
-		h.TailOffset = newOff
-	}
-
-	h.HeadOffset = newOff
-	h.Size++
-
-	return writeHeader(f, h)
-}
-
 func (s *OffsetStore) DeleteFirstByValue(handle *Handle, value uint32) (bool, error) {
 	h, err := ensureOffsetHeader(handle)
 	if err != nil {
@@ -326,11 +287,9 @@ func (s *OffsetStore) DeleteFirstByValue(handle *Handle, value uint32) (bool, er
 			originalNext := node.Next
 
 			node.Tomb = 1
-			node.Next = h.FreeList
 			if err := writeNodeAt(f, off, node); err != nil {
 				return false, err
 			}
-			h.FreeList = off
 
 			if prevOff == NullOffset {
 				// head 가 지워지는 경우
@@ -404,20 +363,16 @@ func main() {
 	}
 	defer store.Close(handle)
 
-	// 머리/꼬리 섞어서 삽입해보자(랜덤 I/O 상황 만들기)
-	// list: [H] 2 -> 1 -> 0   (prepend 2,1,0)
-	if err := store.PrependHead(handle, 0); err != nil {
+	if err := store.AppendTail(handle, 0); err != nil {
 		panic(err)
 	}
-	if err := store.PrependHead(handle, 1); err != nil {
+	if err := store.AppendTail(handle, 1); err != nil {
 		panic(err)
 	}
-	if err := store.PrependHead(handle, 2); err != nil {
+	if err := store.AppendTail(handle, 2); err != nil {
 		panic(err)
 	}
 
-	// 꼬리에 추가 x3
-	// list: 2 -> 1 -> 0 -> 3 -> 4 -> 5
 	if err := store.AppendTail(handle, 3); err != nil {
 		panic(err)
 	}
@@ -460,6 +415,6 @@ func main() {
 	if err := readHeader(handle.File, hdr); err != nil {
 		panic(err)
 	}
-	fmt.Printf("Header{Head=%d, Tail=%d, Size=%d, FreeList=%d}\n",
-		hdr.HeadOffset, hdr.TailOffset, hdr.Size, hdr.FreeList)
+	fmt.Printf("Header{Head=%d, Tail=%d, Size=%d}\n",
+		hdr.HeadOffset, hdr.TailOffset, hdr.Size)
 }
