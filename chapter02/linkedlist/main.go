@@ -25,6 +25,7 @@ type LinkedListStore interface {
 	AppendTail(h *Handle, value uint32) error
 	DeleteFirstByValue(h *Handle, value uint32) (bool, error)
 	TraverseValues(h *Handle) ([]uint32, error)
+	Where(h *Handle, target uint32) (int64, error)
 	Close(h *Handle) error
 }
 
@@ -61,15 +62,11 @@ func (h *Header) headerVersion() uint16 {
 }
 
 // LinkedList 노드
-// - Value: 실제 값(32비트 정수; 예제 단순화를 위해 uint32 이용)
-// - Next: 다음 노드의 파일 오프셋 (없으면 -1)
-// - Tomb: 논리 삭제 마크 (0 == 유효, 1 == 삭제됨). 물리 삭제는 하지 않음
-// - _pad: 16 바이트 정렬을 위해 3바이트 패딩 (읽기 쉬운 고정 길이 유지)
 type Node struct {
-	Value uint32
-	Next  int64
-	Tomb  uint8
-	_pad  [nodePadBytes]byte
+	Value uint32             // - Value: 실제 값(32비트 정수; 예제 단순화를 위해 uint32 이용)
+	Next  int64              // - Next: 다음 노드의 파일 오프셋 (없으면 -1)
+	Tomb  uint8              // - Tomb: 논리 삭제 마크 (0 == 유효, 1 == 삭제됨). 물리 삭제는 하지 않음
+	_pad  [nodePadBytes]byte // - _pad: 16 바이트 정렬을 위해 3바이트 패딩 (읽기 쉬운 고정 길이 유지)
 }
 
 func ensureOffsetHeader(h *Handle) (*Header, error) {
@@ -353,9 +350,32 @@ func (s *OffsetStore) TraverseValues(handle *Handle) ([]uint32, error) {
 	return out, nil
 }
 
+func (s *OffsetStore) Where(handle *Handle, target uint32) (int64, error) {
+	h, err := ensureOffsetHeader(handle)
+	if err != nil {
+		return 0, err
+	}
+	f := handle.File
+
+	off := h.HeadOffset
+
+	for off != NullOffset {
+		node, err := readNodeAt(f, off)
+		if err != nil {
+			return 0, err
+		}
+		if node.Tomb == 0 && node.Value == target {
+			return off, nil
+		}
+		off = node.Next
+	}
+	return NullOffset, nil
+}
+
 func main() {
 	var store LinkedListStore = &OffsetStore{}
 
+	N := 10000
 	// 교육용: 항상 새로 시작(O_TRUNC)
 	handle, err := store.Open("linked_list.db", true)
 	if err != nil {
@@ -363,58 +383,16 @@ func main() {
 	}
 	defer store.Close(handle)
 
-	if err := store.AppendTail(handle, 0); err != nil {
-		panic(err)
-	}
-	if err := store.AppendTail(handle, 1); err != nil {
-		panic(err)
-	}
-	if err := store.AppendTail(handle, 2); err != nil {
-		panic(err)
+	for i := 0; i < N; i++ {
+		if err := store.AppendTail(handle, uint32(i)); err != nil {
+			panic(err)
+		}
 	}
 
-	if err := store.AppendTail(handle, 3); err != nil {
-		panic(err)
+	offset, _ := store.Where(handle, 9999)
+	if offset != NullOffset {
+		fmt.Println("Found offset:", offset)
+	} else {
+		fmt.Println("Not found")
 	}
-	if err := store.AppendTail(handle, 4); err != nil {
-		panic(err)
-	}
-	if err := store.AppendTail(handle, 5); err != nil {
-		panic(err)
-	}
-
-	// 순회 출력(삭제 전)
-	vals, err := store.TraverseValues(handle)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("before delete:", vals) // 기대: [2 1 0 3 4 5]
-
-	// 값 3을 논리 삭제(첫 매칭만)
-	found, err := store.DeleteFirstByValue(handle, 3)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("deleted 3? ->", found)
-
-	// 순회 출력(삭제 후)
-	vals, err = store.TraverseValues(handle)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("after delete :", vals) // 기대: [2 1 0 4 5]
-
-	// 헤더를 다시 읽어 확인(파일 재오픈 상황 흉내)
-	if _, err := handle.File.Seek(0, io.SeekStart); err != nil {
-		panic(err)
-	}
-	hdr, err := ensureOffsetHeader(handle)
-	if err != nil {
-		panic(err)
-	}
-	if err := readHeader(handle.File, hdr); err != nil {
-		panic(err)
-	}
-	fmt.Printf("Header{Head=%d, Tail=%d, Size=%d}\n",
-		hdr.HeadOffset, hdr.TailOffset, hdr.Size)
 }
