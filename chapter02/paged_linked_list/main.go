@@ -48,6 +48,7 @@ type LinkedListStore interface {
 	DeleteFirstByValue(h *Handle, value uint32) (bool, error)
 	TraverseValues(h *Handle) ([]uint32, error)
 	TraverseValuesPhysical(h *Handle) ([]uint32, error)
+	Where(h *Handle, target uint32) (*Location, error)
 	Close(h *Handle) error
 }
 
@@ -95,6 +96,12 @@ type PageBuffer struct {
 	pageID uint32 // 현재 버퍼가 담고 있는 페이지 ID
 	data   []byte // len == PAGE_SIZE
 	valid  bool   // 아직 안 채워졌는지 여부
+}
+
+// Location represents a position in the paged linked list
+type Location struct {
+	Page uint32
+	Slot uint16
 }
 
 func ensurePagedHeader(h *Handle) (*Header, error) {
@@ -459,6 +466,34 @@ func (s *PagedStore) TraverseValues(handle *Handle) ([]uint32, error) {
 	return values, nil
 }
 
+func (s *PagedStore) Where(handle *Handle, target uint32) (*Location, error) {
+	h, err := ensurePagedHeader(handle)
+	if err != nil {
+		return nil, err
+	}
+	f := handle.File
+
+	page := h.HeadPage
+	slot := h.HeadSlot
+
+	var pb PageBuffer
+
+	for page != NullPage && slot != NullSlot {
+		node, err := readSlotWithBuffer(f, &pb, page, slot)
+		if err != nil {
+			return nil, err
+		}
+
+		if node.Tomb == 0 && node.Value == target {
+			return &Location{Page: page, Slot: slot}, nil
+		}
+		page = node.NextPage
+		slot = node.NextSlot
+	}
+
+	return nil, nil
+}
+
 func (s *PagedStore) TraverseValuesPhysical(handle *Handle) ([]uint32, error) {
 	h, err := ensurePagedHeader(handle)
 	if err != nil {
@@ -664,4 +699,36 @@ func main() {
 	}
 	fmt.Printf("Header{PageCount=%d, Size=%d, Head=(%d,%d), Tail=(%d,%d)}\n",
 		hdr.PageCount, hdr.Size, hdr.HeadPage, hdr.HeadSlot, hdr.TailPage, hdr.TailSlot)
+
+	// Where 함수 테스트
+	loc, err := store.Where(handle, 4)
+	if err != nil {
+		panic(err)
+	}
+	if loc != nil {
+		fmt.Printf("Found value 4 at Page=%d, Slot=%d\n", loc.Page, loc.Slot)
+	} else {
+		fmt.Println("Value 4 not found")
+	}
+
+	// 존재하지 않는 값 검색
+	loc, err = store.Where(handle, 9999)
+	if err != nil {
+		panic(err)
+	}
+	if loc != nil {
+		fmt.Printf("Found value 9999 at Page=%d, Slot=%d\n", loc.Page, loc.Slot)
+	} else {
+		fmt.Println("Value 9999 not found")
+	}
+
+	loc, err = store.Where(handle, 2)
+	if err != nil {
+		panic(err)
+	}
+	if loc != nil {
+		fmt.Printf("Found value 2 at Page=%d, Slot=%d\n", loc.Page, loc.Slot)
+	} else {
+		fmt.Println("Value 2 not found")
+	}
 }
