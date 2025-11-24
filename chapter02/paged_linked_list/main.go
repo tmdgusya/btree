@@ -86,8 +86,8 @@ type Node struct {
 	Value    uint32
 	NextPage uint32
 	NextSlot uint16
-	_pad     uint32
 	Tomb     uint8
+	_pad     uint32
 }
 
 type PageBuffer struct {
