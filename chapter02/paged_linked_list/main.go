@@ -14,7 +14,6 @@ var ErrInvalidMagic = errors.New("Invalid file: magic mismatch")
 
 const PAGE_SIZE = 4096
 
-// 페이지 헤더 크기 (byte). 여기서는 "Used" 값 하나만 둔다.
 const PAGE_HEADER_SIZE = 2
 
 // 슬롯(노드) 하나가 디스크에 차지하는 크기(byte).
@@ -22,12 +21,12 @@ const PAGE_HEADER_SIZE = 2
 // - NextPage: uint32 (4 바이트)
 // - NextSlot: uint16 (2 바이트)
 // - Tomb: uint8 (1 바이트)
-// - padding: uint8 (1 바이트)
-const SLOT_SIZE = 12 // 4 + 4 + 2 + 1 + 1
+// - padding: uint32 (4 바이트)
+const SLOT_SIZE = 16 // 4 + 4 + 2 + 1 + 4
 
 // 한 페이지안에 들어갈 수 있는 Slot 개수
 // 페이지 전체에서 페이지 헤더를 제외한 공간을 슬롯 크기로 나눔
-const SLOTS_PER_PAGE = (PAGE_SIZE - PAGE_HEADER_SIZE) / SLOT_SIZE
+const SLOTS_PER_PAGE = (PAGE_SIZE) / SLOT_SIZE
 
 // 헤더의 고정 크기(바이트 단위)
 // Magic(4 바이트) + Version(2 바이트) + PageSize(2 바이트) + PageCount(4 바이트)
@@ -44,7 +43,6 @@ const NullSlot uint16 = ^uint16(0)
 type LinkedListStore interface {
 	Open(path string, truncate bool) (*Handle, error)
 	AppendTail(h *Handle, value uint32) error
-	PrependHead(h *Handle, value uint32) error
 	DeleteFirstByValue(h *Handle, value uint32) (bool, error)
 	TraverseValues(h *Handle) ([]uint32, error)
 	TraverseValuesPhysical(h *Handle) ([]uint32, error)
@@ -81,7 +79,7 @@ func (h *Header) headerVersion() uint16 {
 
 // Used - 이 페이지에서 사용중인 슬롯 개수
 type PageHeader struct {
-	Used uint16
+	Length uint16
 }
 
 type Node struct {
@@ -89,7 +87,7 @@ type Node struct {
 	NextPage uint32
 	NextSlot uint16
 	Tomb     uint8
-	_pad     uint8
+	_pad     uint32
 }
 
 type PageBuffer struct {
@@ -249,7 +247,7 @@ func readPageHeader(f *os.File, pageID uint32) (PageHeader, error) {
 	}
 
 	var ph PageHeader
-	ph.Used = Endian.Uint16(buf[0:2])
+	ph.Length = Endian.Uint16(buf[0:2])
 	return ph, nil
 }
 
@@ -260,7 +258,7 @@ func writePageHeader(f *os.File, pageID uint32, ph PageHeader) error {
 	}
 
 	buf := make([]byte, PAGE_HEADER_SIZE)
-	Endian.PutUint16(buf[0:2], ph.Used)
+	Endian.PutUint16(buf[0:2], ph.Length)
 
 	_, err := f.Write(buf)
 	return err
@@ -280,7 +278,7 @@ func writeSlot(f *os.File, pageID uint32, slotID uint16, node Node) error {
 	Endian.PutUint32(buf[4:8], node.NextPage)
 	Endian.PutUint16(buf[8:10], node.NextSlot)
 	buf[10] = node.Tomb
-	buf[11] = node._pad // 의미없는 패딩값 (0 유지)
+	Endian.PutUint32(buf[11:15], node._pad) // 의미없는 패딩값 (0 유지)
 
 	_, err := f.Write(buf)
 	return err
@@ -302,7 +300,7 @@ func readSlot(f *os.File, pageID uint32, slotID uint16) (Node, error) {
 	node.NextPage = Endian.Uint32(buf[4:8])
 	node.NextSlot = Endian.Uint16(buf[8:10])
 	node.Tomb = buf[10]
-	node._pad = buf[11]
+	node._pad = Endian.Uint32(buf[11:15])
 
 	return node, nil
 }
@@ -329,17 +327,17 @@ func allocateSlot(f *os.File, h *Header) (pageID uint32, slotIndex uint16, err e
 		return
 	}
 
-	if int(ph.Used) >= SLOTS_PER_PAGE {
+	if int(ph.Length) >= SLOTS_PER_PAGE {
 		pageID = h.PageCount // 새 페이지 번호
 		if err = initEmptyPage(f, pageID); err != nil {
 			return
 		}
 		h.PageCount++
-		ph.Used = 0
+		ph.Length = 0
 	}
 
-	slotIndex = ph.Used
-	ph.Used++
+	slotIndex = ph.Length
+	ph.Length++
 	if err = writePageHeader(f, pageID, ph); err != nil {
 		return
 	}
@@ -398,40 +396,6 @@ func (s *PagedStore) AppendTail(handle *Handle, value uint32) error {
 
 	h.TailPage = pageID
 	h.TailSlot = slotIndex
-	h.Size++
-	return writeHeader(f, h)
-}
-
-func (s *PagedStore) PrependHead(handle *Handle, value uint32) error {
-	h, err := ensurePagedHeader(handle)
-	if err != nil {
-		return err
-	}
-	f := handle.File
-
-	pageID, slotIndex, err := allocateSlot(f, h)
-	if err != nil {
-		return err
-	}
-
-	newNode := &Node{
-		Value:    value,
-		NextPage: h.HeadPage,
-		NextSlot: h.HeadSlot,
-		Tomb:     0,
-		_pad:     0,
-	}
-
-	if err := writeSlot(f, pageID, slotIndex, *newNode); err != nil {
-		return err
-	}
-
-	if h.HeadPage == NullPage {
-		h.TailPage = pageID
-		h.TailSlot = slotIndex
-	}
-	h.HeadPage = pageID
-	h.HeadSlot = slotIndex
 	h.Size++
 	return writeHeader(f, h)
 }
@@ -509,7 +473,7 @@ func (s *PagedStore) TraverseValuesPhysical(handle *Handle) ([]uint32, error) {
 			return nil, err
 		}
 
-		for slotID := uint16(0); slotID < ph.Used; slotID++ {
+		for slotID := uint16(0); slotID < ph.Length; slotID++ {
 			node, err := readSlot(f, pageID, slotID)
 			if err != nil {
 				return nil, err
@@ -562,7 +526,7 @@ func readSlotWithBuffer(f *os.File, pb *PageBuffer, pageID uint32, slotID uint16
 	node.NextPage = Endian.Uint32(slotBytes[4:8])
 	node.NextSlot = Endian.Uint16(slotBytes[8:10])
 	node.Tomb = slotBytes[10]
-	node._pad = slotBytes[11]
+	node._pad = Endian.Uint32(slotBytes[11:15])
 
 	return node, nil
 }

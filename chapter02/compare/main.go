@@ -22,8 +22,9 @@ const PAGE_HEADER_SIZE = 2
 // NextPage uint32 (4)
 // NextSlot uint16 (2)
 // Tomb     uint8  (1)
-// _pad     uint8  (1)
-const SLOT_SIZE = 12
+// padding  uint8  (1)
+// _pad     uint32 (4)
+const SLOT_SIZE = 16
 
 const HEADER_SIZE = 32 // Magic(4) + Version(2) + PageSize(2) + PageCount(4) + HeadPage(4) + HeadSlot(2) + TailPage(4) + TailSlot(2) + Size(8)
 
@@ -53,7 +54,7 @@ type Node struct {
 	NextPage uint32
 	NextSlot uint16
 	Tomb     uint8
-	_pad     uint8
+	_pad     uint32
 }
 
 // ==================================
@@ -200,7 +201,7 @@ func writeSlot(cf *CountingFile, pageID uint32, slotID uint16, node Node) error 
 	Endian.PutUint32(buf[4:8], node.NextPage)
 	Endian.PutUint16(buf[8:10], node.NextSlot)
 	buf[10] = node.Tomb
-	buf[11] = node._pad
+	Endian.PutUint32(buf[12:16], node._pad)
 
 	_, err := cf.Write(buf)
 	return err
@@ -223,7 +224,7 @@ func readSlotNaive(cf *CountingFile, pageID uint32, slotID uint16) (Node, error)
 	node.NextPage = Endian.Uint32(buf[4:8])
 	node.NextSlot = Endian.Uint16(buf[8:10])
 	node.Tomb = buf[10]
-	node._pad = buf[11]
+	node._pad = Endian.Uint32(buf[12:16])
 	return node, nil
 }
 
@@ -272,7 +273,7 @@ func readSlotWithBuffer(cf *CountingFile, pb *PageBuffer, pageID uint32, slotID 
 	node.NextPage = Endian.Uint32(slotBytes[4:8])
 	node.NextSlot = Endian.Uint16(slotBytes[8:10])
 	node.Tomb = slotBytes[10]
-	node._pad = slotBytes[11]
+	node._pad = Endian.Uint32(slotBytes[12:16])
 	return node, nil
 }
 
@@ -408,7 +409,7 @@ func traverseBuffered(cf *CountingFile, h *Header) ([]uint32, error) {
 // ==================================
 
 func main() {
-	const N = 100000
+	const N = 10000
 	const path = "paged_buffer_compare.llst"
 
 	// 깨끗하게 시작
